@@ -1,0 +1,5 @@
+Adafruit CircuitPython 9.1.2 on 2024-08-22; M5Stack AtomS3 with ESP32S3
+Board ID:m5stack_atoms3
+UID:4285C7C5F149
+boot.py output:
++ Enabled JoystickXL 0.4.3 with 4 axes, 1 buttons and 1 hats for a total of 6 report bytes.
