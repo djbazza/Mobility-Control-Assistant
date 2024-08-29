@@ -15,10 +15,12 @@ AXIS_MIN = -127  # Minimum raw axis value.
 AXIS_MAX = 127 # Maximum raw axis value.
 
 # Axis configuration constants
-ACCEL_DB = 10 # Deadband to apply to axis center points.
-ACCEL_MIN = -100  # Minimum raw axis value.
-ACCEL_MAX = 100 # Maximum raw axis value.
+factor = 20
+ACCEL_DB = 4*factor # Deadband to apply to axis center points.
+ACCEL_MIN = -8*factor  # Minimum raw axis value.
+ACCEL_MAX = 8*factor # Maximum raw axis value.
 
+sampling_ms = 150
 
 # IMU6866 define
 MPU6886_ADDRESS=0x68
@@ -48,12 +50,12 @@ print(sensor.gyro())
 while True:
     gyro_array = sensor.gyro()
     accel_array = sensor.acceleration()
-    hotas.axis[0].source_value = int(accel_array[0]*10)
-    hotas.axis[1].source_value = int(accel_array[1]*10)
+    hotas.axis[0].source_value = int(accel_array[0]*factor)
+    hotas.axis[1].source_value = 0-int(accel_array[1]*factor)
     hotas.axis[2].source_value = jhat.get_x()
     hotas.axis[3].source_value = jhat.get_y()
     hotas.button[0].source_value = 1 - jhat.get_button_status()
     hotas.update()
     print(jhat.get_x())
     print(accel_array)
-    time.sleep(0.1)
+    time.sleep(sampling_ms/1000)
