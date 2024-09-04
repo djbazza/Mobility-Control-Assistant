@@ -1,420 +1,195 @@
-"""
-The base JoystickXL class for updating input states and sending USB HID reports.
+# SPDX-FileCopyrightText: 2024 Michał Pokusa
+#
+# SPDX-License-Identifier: Unlicense
 
-This module provides the necessary functions to create a JoystickXL object,
-retrieve its input counts, associate input objects and update its input states.
-"""
-
-import struct
+import socketpool
+import wifi
+import board
 import time
-
-# These typing imports help during development in vscode but fail in CircuitPython
-try:
-    from typing import Tuple, Union
-except ImportError:
-    pass
-
-from joystick_xl.hid import _get_device
+import busio
+from adafruit_bus_device.i2c_device import I2CDevice
+from mpu6886 import MPU6886
+import struct
+import busio  # type: ignore (This too!)
 from joystick_xl.inputs import Axis, Button, Hat
-
-
-class Joystick:
-    """Base JoystickXL class for updating input states and sending USB HID reports."""
-
-    _num_axes = 0
-    """The number of axes this joystick can support."""
-
-    _num_buttons = 0
-    """The number of buttons this joystick can support."""
-
-    _num_hats = 0
-    """The number of hat switches this joystick can support."""
-
-    _report_size = 0
-    """The size (in bytes) of USB HID reports for this joystick."""
-
-    @property
-    def num_axes(self) -> int:
-        """Return the number of available axes in the USB HID descriptor."""
-        return self._num_axes
-
-    @property
-    def num_buttons(self) -> int:
-        """Return the number of available buttons in the USB HID descriptor."""
-        return self._num_buttons
-
-    @property
-    def num_hats(self) -> int:
-        """Return the number of available hat switches in the USB HID descriptor."""
-        return self._num_hats
-
-    def __init__(self) -> None:
-        """
-        Create a JoystickXL object with all inputs in idle states.
-
-        .. code::
-
-           from joystick_xl.joystick import Joystick
-
-           js = Joystick()
-
-        .. note:: A JoystickXL ``usb_hid.Device`` object has to be created in
-           ``boot.py`` before creating a ``Joystick()`` object in ``code.py``,
-           otherwise an exception will be thrown.
-        """
-        # load configuration from ``boot_out.txt``
-        try:
-            with open("/boot_out.txt", "r") as boot_out:
-                for line in boot_out.readlines():
-                    if "JoystickXL" in line:
-                        config = [int(s) for s in line.split() if s.isdigit()]
-                        if len(config) < 4:
-                            raise (ValueError)
-                        Joystick._num_axes = config[0]
-                        Joystick._num_buttons = config[1]
-                        Joystick._num_hats = config[2]
-                        Joystick._report_size = config[3]
-                        break
-            if Joystick._report_size == 0:
-                raise (ValueError)
-        except (OSError, ValueError):
-            raise (Exception("Error loading JoystickXL configuration."))
-
-        self._device = _get_device()
-        self._report = bytearray(self._report_size)
-        self._last_report = bytearray(self._report_size)
-        self._format = "<"
-
-        self.axis = list()
-        """List of axis inputs associated with this joystick through ``add_input``."""
-
-        self._axis_states = list()
-        for _ in range(self.num_axes):
-            self._axis_states.append(Axis.IDLE)
-            self._format += "B"
-
-        self.hat = list()
-        """List of hat inputs associated with this joystick through ``add_input``."""
-
-        self._hat_states = [Hat.IDLE] * self.num_hats
-        if self.num_hats > 2:
-            self._format += "H"
-        elif self.num_hats:
-            self._format += "B"
-
-        self.button = list()
-        """List of button inputs associated with this joystick through ``add_input``."""
-
-        self._button_states = list()
-        for _ in range((self.num_buttons // 8) + bool(self.num_buttons % 8)):
-            self._button_states.append(0)
-            self._format += "B"
-
-        try:
-            self.reset_all()
-        except OSError:
-            time.sleep(1)
-            self.reset_all()
-
-    @staticmethod
-    def _validate_axis_value(axis: int, value: int) -> bool:
-        """
-        Ensure the supplied axis index and value are valid.
-
-        :param axis: The 0-based index of the axis to validate.
-        :type axis: int
-        :param value: The axis value to validate.
-        :type value: int
-        :raises ValueError: No axes are configured for the JoystickXL device.
-        :raises ValueError: The supplied axis index is out of range.
-        :raises ValueError: The supplied axis value is out of range.
-        :return: ``True`` if the supplied axis index and value are valid.
-        :rtype: bool
-        """
-        if Joystick._num_axes == 0:
-            raise ValueError("There are no axes configured.")
-        if axis + 1 > Joystick._num_axes:
-            raise ValueError("Specified axis is out of range.")
-        if not Axis.MIN <= value <= Axis.MAX:
-            raise ValueError("Axis value must be in range 0 to 255")
-        return True
-
-    @staticmethod
-    def _validate_button_number(button: int) -> bool:
-        """
-        Ensure the supplied button index is valid.
-
-        :param button: The 0-based index of the button to validate.
-        :type button: int
-        :raises ValueError: No buttons are configured for the JoystickXL device.
-        :raises ValueError: The supplied button index is out of range.
-        :return: ``True`` if the supplied button index is valid.
-        :rtype: bool
-        """
-        if Joystick._num_buttons == 0:
-            raise ValueError("There are no buttons configured.")
-        if not 0 <= button <= Joystick._num_buttons - 1:
-            raise ValueError("Specified button is out of range.")
-        return True
-
-    @staticmethod
-    def _validate_hat_value(hat: int, position: int) -> bool:
-        """
-        Ensure the supplied hat switch index and position are valid.
-
-        :param hat: The 0-based index of the hat switch to validate.
-        :type hat: int
-        :param value: The hat switch position to validate.
-        :type value: int
-        :raises ValueError: No hat switches are configured for the JoystickXL device.
-        :raises ValueError: The supplied hat switch index is out of range.
-        :raises ValueError: The supplied hat switch position is out of range.
-        :return: ``True`` if the supplied hat switch index and position are valid.
-        :rtype: bool
-        """
-        if Joystick._num_hats == 0:
-            raise ValueError("There are no hat switches configured.")
-        if hat + 1 > Joystick._num_hats:
-            raise ValueError("Specified hat is out of range.")
-        if not 0 <= position <= 8:
-            raise ValueError("Hat value must be in range 0 to 8")
-        return True
-
-    def add_input(self, *input: Union[Axis, Button, Hat]) -> None:
-        """
-        Associate one or more axis, button or hat inputs with the joystick.
-
-        The provided input(s) are automatically added to the ``axis``, ``button`` and
-        ``hat`` lists based on their type.  The order in which inputs are added will
-        determine their index/reference number. (i.e., the first button object that is
-        added will be ``Joystick.button[0]``.)  Inputs of all types can be added at the
-        same time and will be sorted into the correct list.
-
-        :param input: One or more ``Axis``, ``Button`` or ``Hat`` objects.
-        :type input: Axis, Button, or Hat
-        :raises TypeError: If an object that is not an ``Axis``, ``Button`` or ``Hat``
-            is passed in.
-        :raises OverflowError: If an attempt is made to add more than the available
-            number of axes, buttons or hat switches to the respective list.
-        """
-        for i in input:
-            if isinstance(i, Axis):
-                if len(self.axis) < self._num_axes:
-                    self.axis.append(i)
-                else:
-                    raise OverflowError("List is full, cannot add another axis.")
-            elif isinstance(i, Button):
-                if len(self.button) < self._num_buttons:
-                    self.button.append(i)
-                else:
-                    raise OverflowError("List is full, cannot add another button.")
-            elif isinstance(i, Hat):
-                if len(self.hat) < self._num_hats:
-                    self.hat.append(i)
-                else:
-                    raise OverflowError("List is full, cannot add another hat switch.")
-            else:
-                raise TypeError("Input must be a Button, Axis or Hat object.")
-
-    def update(self, always: bool = False, halt_on_error: bool = False) -> None:
-        """
-        Update all inputs in associated input lists and generate a USB HID report.
-
-        :param always: When ``True``, send a report even if it is identical to the last
-            report that was sent out.  Defaults to ``False``.
-        :type always: bool, optional
-        :param halt_on_error: When ``True``, an exception will be raised and the program
-            will halt if an ``OSError`` occurs when the report is sent.  When ``False``,
-            the report will simply be dropped and no exception will be raised.  Defaults
-            to ``False``.
-        :type halt_on_error: bool, optional
-        """
-        # Update axis values but defer USB HID report generation.
-        if len(self.axis):
-            axis_values = [(i, a.value) for i, a in enumerate(self.axis)]
-            self.update_axis(*axis_values, defer=True, skip_validation=True)
-
-        # Update button states but defer USB HID report generation.
-        if len(self.button):
-            button_values = [(i, b.value) for i, b in enumerate(self.button)]
-            self.update_button(*button_values, defer=True, skip_validation=True)
-
-        # Update hat switch values, but defer USB HID report generation.
-        if len(self.hat):
-            hat_values = [(i, h.value) for i, h in enumerate(self.hat)]
-            self.update_hat(*hat_values, defer=True, skip_validation=True)
-
-        # Generate a USB HID report.
-        report_data = list()
-
-        report_data.extend(self._axis_states)
-
-        if self.num_hats:
-            _hat_state = 0
-            for i in range(self.num_hats):
-                _hat_state |= self._hat_states[i] << (4 * (self.num_hats - i - 1))
-            report_data.append(_hat_state)
-
-        report_data.extend(self._button_states)
-
-        struct.pack_into(self._format, self._report, 0, *report_data)
-
-        # Send the USB HID report if required.
-        if always or self._last_report != self._report:
-            try:
-                self._device.send_report(self._report)
-                self._last_report[:] = self._report
-            except OSError:
-                # This can occur if the USB is busy, or the host never properly
-                # connected to the USB device.  We just drop the update and try later.
-                if halt_on_error:
-                    raise
-
-    def reset_all(self) -> None:
-        """Reset all inputs to their idle states."""
-        for i in range(self.num_axes):
-            self._axis_states[i] = Axis.IDLE
-        for i in range(len(self._button_states)):
-            self._button_states[i] = 0
-        for i in range(self.num_hats):
-            self._hat_states[i] = Hat.IDLE
-        self.update(always=True)
-
-    def update_axis(
-        self,
-        *axis: Tuple[int, int],
-        defer: bool = False,
-        skip_validation: bool = False,
-    ) -> None:
-        """
-        Update the value of one or more axis input(s).
-
-        :param axis: One or more tuples containing an axis index (0-based) and value
-           (``0`` to ``255``, with ``128`` indicating the axis is idle/centered).
-        :type axis: Tuple[int, int]
-        :param defer: When ``True``, prevents sending a USB HID report upon completion.
-           Defaults to ``False``.
-        :type defer: bool
-        :param skip_validation: When ``True``, bypasses the normal input number/value
-           validation that occurs before they get processed.  This is used for *known
-           good values* that are generated using the ``Joystick.axis[]``,
-           ``Joystick.button[]`` and ``Joystick.hat[]`` lists.  Defaults to ``False``.
-        :type skip_validation: bool
-
-        .. code::
-
-           # Updates a single axis
-           update_axis((0, 42))  # 0 = x-axis
-
-           # Updates multiple axes
-           update_axis((1, 22), (3, 237))  # 1 = y-axis, 3 = rx-axis
-
-        .. note::
-
-           ``update_axis`` is called automatically for any axis objects added to the
-           built in ``Joystick.axis[]`` list when ``Joystick.update()`` is called.
-        """
-        for a, value in axis:
-            if skip_validation or self._validate_axis_value(a, value):
-                if self.num_axes > 7 and a > 5:
-                    a = self.num_axes - a + 5  # reverse sequence for sliders
-                self._axis_states[a] = value
-
-        if not defer:
-            self.update()
-
-    def update_button(
-        self,
-        *button: Tuple[int, bool],
-        defer: bool = False,
-        skip_validation: bool = False,
-    ) -> None:
-        """
-        Update the value of one or more button input(s).
-
-        :param button: One or more tuples containing a button index (0-based) and
-           value (``True`` if pressed, ``False`` if released).
-        :type button: Tuple[int, bool]
-        :param defer: When ``True``, prevents sending a USB HID report upon completion.
-           Defaults to ``False``.
-        :type defer: bool
-        :param skip_validation: When ``True``, bypasses the normal input number/value
-           validation that occurs before they get processed.  This is used for *known
-           good values* that are generated using the ``Joystick.axis[]``,
-           ``Joystick.button[]`` and ``Joystick.hat[]`` lists.  Defaults to ``False``.
-        :type skip_validation: bool
-
-        .. code::
-
-           # Update a single button
-           update_button((0, True))  # 0 = b1
-
-           # Updates multiple buttons
-           update_button((1, False), (7, True))  # 1 = b2, 7 = b8
-
-        .. note::
-
-           ``update_button`` is called automatically for any button objects added to the
-           built in ``Joystick.button[]`` list when ``Joystick.update()`` is called.
-        """
-        for b, value in button:
-            if skip_validation or self._validate_button_number(b):
-                _bank = b // 8
-                _bit = b % 8
-                if value:
-                    self._button_states[_bank] |= 1 << _bit
-                else:
-                    self._button_states[_bank] &= ~(1 << _bit)
-        if not defer:
-            self.update()
-
-    def update_hat(
-        self,
-        *hat: Tuple[int, int],
-        defer: bool = False,
-        skip_validation: bool = False,
-    ) -> None:
-        """
-        Update the value of one or more hat switch input(s).
-
-        :param hat: One or more tuples containing a hat switch index (0-based) and
-           value.  Valid hat switch values range from ``0`` to ``8`` as follows:
-
-              * ``0`` = UP
-              * ``1`` = UP + RIGHT
-              * ``2`` = RIGHT
-              * ``3`` = DOWN + RIGHT
-              * ``4`` = DOWN
-              * ``5`` = DOWN + LEFT
-              * ``6`` = LEFT
-              * ``7`` = UP + LEFT
-              * ``8`` = IDLE
-
-        :type hat: Tuple[int, int]
-        :param defer: When ``True``, prevents sending a USB HID report upon completion.
-           Defaults to ``False``.
-        :type defer: bool
-        :param skip_validation: When ``True``, bypasses the normal input number/value
-           validation that occurs before they get processed.  This is used for *known
-           good values* that are generated using the ``Joystick.axis[]``,
-           ``Joystick.button[]`` and ``Joystick.hat[]`` lists.  Defaults to ``False``.
-        :type skip_validation: bool
-
-        .. code::
-
-           # Updates a single hat switch
-           update_hat((0, 3))  # 0 = h1
-
-           # Updates multiple hat switches
-           update_hat((1, 8), (3, 1))  # 1 = h2, 3 = h4
-
-        .. note::
-
-           ``update_hat`` is called automatically for any hat switch objects added to
-           the built in ``Joystick.hat[]`` list when ``Joystick.update()`` is called.
-        """
-        for h, value in hat:
-            if skip_validation or self._validate_hat_value(h, value):
-                self._hat_states[h] = value
-        if not defer:
-            self.update()
+from joystick_xl.joystick import Joystick
+from joystick import JoystickUnit
+
+from adafruit_httpserver import Server, Route, as_route, REQUEST_HANDLED_RESPONSE_SENT, Request, Response, GET, POST
+
+AP_SSID = "MC"
+AP_PASSWORD = "helpmemove"
+
+print("Creating access point...")
+wifi.radio.start_ap(ssid=AP_SSID, password=AP_PASSWORD)
+print(f"Created access point {AP_SSID}")
+
+pool = socketpool.SocketPool(wifi.radio)
+server = Server(pool, "/static", debug=True)
+
+sampling_ms = 150
+minChange = 5
+
+# Axis configuration constants
+AXIS_DB = 0
+AXIS_MIN = -255  # Minimum raw axis value.
+AXIS_MAX = 255 # Maximum raw axis value.
+
+# Axis configuration constants
+factor = 25
+ACCEL_MIN = -8*factor  # Minimum raw axis value.
+ACCEL_MAX = 8*factor # Maximum raw axis value.
+ACCEL_DB = int((ACCEL_MIN + ACCEL_MAX)/2) # Deadband to apply to axis center points.
+
+# IMU6866 define
+MPU6886_ADDRESS=0x68
+
+i2c = busio.I2C(board.IMU_SCL, board.IMU_SDA)
+i2c2 = busio.I2C(board.D1, board.D2)
+imu = I2CDevice(i2c, MPU6886_ADDRESS)
+lcd = board.DISPLAY
+jhat = ""
+assert i2c2.try_lock()
+if 0x52 in i2c2.scan():
+    i2c2.unlock()
+    jhat = JoystickUnit(i2c2, 0x52)
+    jhat.swap_x(1)
+
+sensor = MPU6886(i2c)
+
+hotas = Joystick()
+
+hotas.add_input(
+    Button(),
+    Axis(deadband=AXIS_DB, min=AXIS_MIN, max=AXIS_MAX),
+    Axis(deadband=AXIS_DB, min=AXIS_MIN, max=AXIS_MAX),
+    Axis(deadband=ACCEL_DB, min=ACCEL_MIN, max=ACCEL_MAX),
+    Axis(deadband=ACCEL_DB, min=ACCEL_MIN, max=ACCEL_MAX),
+)
+
+
+FORM_HTML_TEMPLATE = """
+<html lang="en">
+    <head>
+        <title>Form with {enctype} enctype</title>
+    </head>
+    <body>
+        <h2>Please adjust the Joystick Settings</h2>
+        <form action="/form" method="post" enctype="{enctype}">
+            <p>Sample Rate (ms): <span id="sV">{SampleVal}</span> </p>
+            <input type="range" min="10" max="500" value="{SampleVal}" id="Sample" name="Sample">
+            <p>Minimum Range:<span>{MinValDisp}</span></p>
+            <input type="range" min="-255" max="255" value="{MinValDisp}" id="MinVal" name="MinVal">
+            <p>Maximum Range:<span>{MaxValDisp}</span></p>
+            <input type="range" min="-255" max="255" value="{MaxValDisp}" id="MaxVal" name="MaxVal">
+            <p>Minimum Motion Change:<span id="ra">{ChangeVal}</span></p>
+            <input type="range" min="1" max="50" value="{ChangeVal}" id="Change" name="Change">
+            <p>Set Deadband:<span id="dB">{DeadbandVal}</span></p>
+            <input type="range" min="-255" max="255" value="{DeadbandVal}" id="Deadband" name="Deadband">
+            <p>Motion Options</p>
+            <input type="radio" name="Motion" id="RelativeMotion" value="RelativeMotion" checked="checked"> Relative Motion
+            <input type="radio" name="Motion" id="ChangeInMotion" value="ChangeInMotion"> Change in Motion<br>
+            <br><input type="submit" value="Submit">
+        </form>
+        {submitted_value}
+    </body>
+</html>
+"""
+
+
+@server.route("/form", [GET, POST])
+def form(request: Request):
+    """
+    Serve a form with the given enctype, and display back the submitted value.
+    """
+    global sampling_ms
+    global AXIS_MIN # Minimum raw axis value.
+    global AXIS_MAX # Maximum raw axis value.
+    global minChange
+    enctype = request.query_params.get("enctype", "text/plain")
+
+    if request.method == POST:
+        sampling_ms = int(request.form_data.get("Sample"))
+        AXIS_MIN = int(request.form_data.get("MinVal"))
+        AXIS_MAX = int(request.form_data.get("MaxVal"))
+        minChange = int(request.form_data.get("Change"))
+        posted_Deadband = int(request.form_data.get("Deadband"))
+        posted_Motion = request.form_data.get("Motion")
+
+    return Response(
+        request,
+        FORM_HTML_TEMPLATE.format(
+            enctype=enctype,
+            submitted_value=(
+                f"<h3>Submitted form Sample: {sampling_ms}ms</h3>\n<h3>Submitted form Range: {minChange}</h3>\n<h3>Submitted form Deadband: {posted_Deadband}</h3>\n<h3>Submitted form motion: {posted_Motion}</h3>"
+                if request.method == POST
+                else ""
+            ),
+            MinValDisp=(
+                f"{AXIS_MIN}"
+                if request.method == POST
+                else f"{AXIS_MIN}"
+            ),
+            MaxValDisp=(
+                f"{AXIS_MAX}"
+                if request.method == POST
+                else f"{AXIS_MAX}"
+            ),
+            SampleVal=(
+                f"{sampling_ms}"
+                if request.method == POST
+                else f"{sampling_ms}"
+            ),
+            RangeVal=(
+                f"{minChange}"
+                if request.method == POST
+                else f"{minChange}"
+            ),
+            DeadbandVal=(
+                f"{posted_Deadband}"
+                if request.method == POST
+                else f"{AXIS_DB}"
+            ),
+        ),
+        content_type="text/html",
+    )
+
+
+server.start(str(wifi.radio.ipv4_address_ap))
+
+while True:
+    
+    try:
+        gyro_array = sensor.gyro()
+        accel_array = sensor.acceleration()
+        X = int(accel_array[0]*factor)
+        if X > AXIS_MIN and X < AXIS_MAX:
+            # print(f"X: {X}")
+            if X < hotas.axis[0].source_value - minChange or X > hotas.axis[0].source_value + minChange:
+                hotas.axis[0].source_value = X
+        Y = 0-int(accel_array[1]*factor)
+        if Y > AXIS_MIN and Y < AXIS_MAX:
+            if Y < hotas.axis[1].source_value - minChange or Y > hotas.axis[1].source_value + minChange:
+                hotas.axis[1].source_value = Y
+                #print(f"Y: {hotas.axis[1].source_value}")
+        if jhat:
+            hotas.axis[2].source_value = jhat.get_x()
+            hotas.axis[3].source_value = jhat.get_y()
+            hotas.button[0].source_value = 1 - jhat.get_button_status()
+        hotas.update()
+        # print(jhat.get_x())
+        #print(accel_array)
+        
+                # Process any waiting requests
+        pool_result = server.poll()
+        
+        if pool_result == REQUEST_HANDLED_RESPONSE_SENT:
+            # Do something only after handling a request
+            pass
+            
+        time.sleep(sampling_ms/1000)
+
+        # If you want you can stop the server by calling server.stop() anywhere in your code
+    except OSError as error:
+        print(error)
+        continue
